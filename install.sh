@@ -20,7 +20,7 @@ readonly REPO_URL="https://github.com/EVOZXLabs/zetbot-ai.git"
 readonly DEFAULT_BRANCH="main"
 readonly DEFAULT_INSTALL_DIR="${HOME}/zetbot-ai"
 readonly REQUIRED_PACKAGES=(git curl python3 python3-pip python3-venv)
-readonly TERMUX_REQUIRED_PACKAGES=(git curl python)
+readonly TERMUX_REQUIRED_PACKAGES=(git curl python python-numpy python-pandas cmake ninja)
 readonly SUPPORTED_DISTROS=(ubuntu debian linuxmint)
 
 BRANCH="${DEFAULT_BRANCH}"
@@ -366,7 +366,14 @@ setup_virtualenv() {
         log_success "Virtual environment already exists. Skipping creation."
     else
         log_info "Creating virtual environment..."
-        python3 -m venv .venv
+        if [[ "${IS_TERMUX}" == true ]]; then
+            # Reuse Termux's prebuilt numpy/pandas (installed via pkg) instead
+            # of letting pip compile them from source, which is slow and
+            # frequently fails on Android/Termux.
+            python3 -m venv --system-site-packages .venv
+        else
+            python3 -m venv .venv
+        fi
         log_success "Virtual environment created."
     fi
 
