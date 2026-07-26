@@ -20,11 +20,13 @@ readonly REPO_URL="https://github.com/EVOZXLabs/zetbot-ai.git"
 readonly DEFAULT_BRANCH="main"
 readonly DEFAULT_INSTALL_DIR="${HOME}/zetbot-ai"
 readonly REQUIRED_PACKAGES=(git curl python3 python3-pip python3-venv)
+readonly TERMUX_REQUIRED_PACKAGES=(git curl python)
 readonly SUPPORTED_DISTROS=(ubuntu debian linuxmint)
 
 BRANCH="${DEFAULT_BRANCH}"
 INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
 NONINTERACTIVE=false
+IS_TERMUX=false
 
 # ----------------------------------------------------------------------------
 # Colors & icons
@@ -198,11 +200,12 @@ parse_args() {
 # ----------------------------------------------------------------------------
 
 detect_environment() {
-    # Placeholder hook for future Termux / Ubuntu-Proot support.
-    # Additional environment types can be added here without redesigning
-    # the rest of the installer.
-    if [[ -n "${TERMUX_VERSION:-}" ]]; then
-        die "Termux is not yet officially supported by this installer. Support is planned for a future release."
+    # Termux (Android) is detected via the TERMUX_VERSION env var that the
+    # Termux app exports for every shell it spawns.
+    if [[ -n "${TERMUX_VERSION:-}" ]] || [[ "${PREFIX:-}" == *"com.termux"* ]]; then
+        IS_TERMUX=true
+        log_success "Detected supported environment: Termux (${TERMUX_VERSION:-unknown version})"
+        return 0
     fi
 
     detect_linux_distro
@@ -253,7 +256,11 @@ check_internet() {
 # ----------------------------------------------------------------------------
 
 require_sudo() {
-    if [[ "${EUID}" -eq 0 ]]; then
+    if [[ "${IS_TERMUX}" == true ]]; then
+        # Termux packages install into the app's own sandbox; there is no
+        # root/sudo involved and none is needed.
+        SUDO=""
+    elif [[ "${EUID}" -eq 0 ]]; then
         SUDO=""
     elif command -v sudo >/dev/null 2>&1; then
         SUDO="sudo"
@@ -264,6 +271,8 @@ require_sudo() {
 
 package_installed() {
     local pkg="$1"
+    # Termux's package manager is also dpkg-based, so this check works
+    # identically on both Termux and Debian-family Linux distros.
     dpkg -s "${pkg}" >/dev/null 2>&1
 }
 
@@ -272,8 +281,11 @@ check_and_install_packages() {
 
     require_sudo
 
+    local packages=("${REQUIRED_PACKAGES[@]}")
+    [[ "${IS_TERMUX}" == true ]] && packages=("${TERMUX_REQUIRED_PACKAGES[@]}")
+
     local missing=()
-    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    for pkg in "${packages[@]}"; do
         if package_installed "${pkg}"; then
             log_success "${pkg} is already installed."
         else
@@ -288,8 +300,13 @@ check_and_install_packages() {
     fi
 
     log_info "Installing missing packages: ${missing[*]}"
-    ${SUDO} apt-get update -y
-    ${SUDO} apt-get install -y "${missing[@]}"
+    if [[ "${IS_TERMUX}" == true ]]; then
+        pkg update -y
+        pkg install -y "${missing[@]}"
+    else
+        ${SUDO} apt-get update -y
+        ${SUDO} apt-get install -y "${missing[@]}"
+    fi
     log_success "Missing packages installed successfully."
 }
 

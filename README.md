@@ -18,12 +18,13 @@ never starts the bot — it only prepares your system to run it.
   - Ubuntu
   - Debian
   - Linux Mint
+- Termux (Android)
 - `bash`
-- `sudo` privileges (only needed if dependencies must be installed)
+- `sudo` privileges (only needed if dependencies must be installed; not
+  required on Termux)
 - An active internet connection
 
-> Support for Termux and Ubuntu Proot environments is planned for a
-> future release.
+> Ubuntu Proot support is planned for a future release.
 
 ## Installation
 
