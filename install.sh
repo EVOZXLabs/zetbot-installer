@@ -268,10 +268,38 @@ detect_linux_distro() {
 check_internet() {
     log_step "Checking internet connectivity"
 
-    if curl -fsS --max-time 5 -o /dev/null "https://github.com"; then
+    # Do not use a single 5-second request to https://github.com here.
+    # On some Android/Termux networks GitHub's main site can be slow or
+    # partially reachable even though raw.githubusercontent.com and git
+    # access work normally. The installer itself was already downloaded
+    # from raw.githubusercontent.com, so this check must not reject a
+    # working network because one endpoint is slow.
+    local urls=(
+        "https://raw.githubusercontent.com/EVOZXLabs/zetbot-ai/main/install.sh"
+        "https://github.com/EVOZXLabs/zetbot-ai"
+        "https://pypi.org/simple/"
+    )
+    local url
+    local ok=false
+
+    for url in "${urls[@]}"; do
+        if curl -fsSL \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 1 \
+            --retry-all-errors \
+            -o /dev/null "${url}" 2>/dev/null; then
+            ok=true
+            break
+        fi
+    done
+
+    if [[ "${ok}" == true ]]; then
         log_success "Internet connection is available."
     else
-        die "No internet connection detected. Please check your network and try again."
+        log_warn "Connectivity check could not reach external endpoints."
+        log_warn "Continuing anyway; git/pkg/pip will report the actual network error if access is unavailable."
     fi
 }
 
