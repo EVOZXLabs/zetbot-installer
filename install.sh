@@ -244,8 +244,12 @@ detect_linux_distro() {
 check_internet() {
     log_step "Checking internet connectivity"
 
-    if curl -fsS --max-time 5 -o /dev/null "https://github.com"; then
+    # Try GitHub first (15s timeout for slow/mobile connections),
+    # fallback to Cloudflare DNS if GitHub is unreachable.
+    if curl -fsS --max-time 15 -o /dev/null "https://github.com" 2>/dev/null; then
         log_success "Internet connection is available."
+    elif curl -fsS --max-time 10 -o /dev/null "https://1.1.1.1" 2>/dev/null; then
+        log_success "Internet connection is available (via fallback)."
     else
         die "No internet connection detected. Please check your network and try again."
     fi
