@@ -5,10 +5,10 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/EVOZXLabs/zetbot-installer/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/EVOZXLabs/zetbot-installer/main/install.sh | bash -s -- --branch dev
+#   curl -fsSL https://raw.githubusercontent.com/EVOZXLabs/zetbot-installer/main/install.sh | bash -s -- --yes
 #
 # This script installs ZetBot AI and its dependencies. It never starts
-# the bot and never overwrites existing user files (.env, repo contents).
+# the bot and never overwrites existing user files (.env, data/).
 
 set -Eeuo pipefail
 
@@ -20,7 +20,9 @@ readonly REPO_URL="https://github.com/EVOZXLabs/zetbot-ai.git"
 readonly DEFAULT_BRANCH="main"
 readonly DEFAULT_INSTALL_DIR="${HOME}/zetbot-ai"
 readonly REQUIRED_PACKAGES=(git curl python3 python3-pip python3-venv)
-readonly TERMUX_REQUIRED_PACKAGES=(git curl python python-numpy python-pandas cmake ninja)
+# Termux: prebuilt numpy/pandas via tur-repo (no source compile needed).
+# clang/openssl/libffi are needed by some pip packages (e.g. cryptography).
+readonly TERMUX_REQUIRED_PACKAGES=(git curl python clang openssl libffi)
 readonly SUPPORTED_DISTROS=(ubuntu debian linuxmint)
 
 BRANCH="${DEFAULT_BRANCH}"
@@ -200,8 +202,6 @@ parse_args() {
 # ----------------------------------------------------------------------------
 
 detect_environment() {
-    # Termux (Android) is detected via the TERMUX_VERSION env var that the
-    # Termux app exports for every shell it spawns.
     if [[ -n "${TERMUX_VERSION:-}" ]] || [[ "${PREFIX:-}" == *"com.termux"* ]]; then
         IS_TERMUX=true
         log_success "Detected supported environment: Termux (${TERMUX_VERSION:-unknown version})"
@@ -257,8 +257,6 @@ check_internet() {
 
 require_sudo() {
     if [[ "${IS_TERMUX}" == true ]]; then
-        # Termux packages install into the app's own sandbox; there is no
-        # root/sudo involved and none is needed.
         SUDO=""
     elif [[ "${EUID}" -eq 0 ]]; then
         SUDO=""
@@ -271,8 +269,6 @@ require_sudo() {
 
 package_installed() {
     local pkg="$1"
-    # Termux's package manager is also dpkg-based, so this check works
-    # identically on both Termux and Debian-family Linux distros.
     dpkg -s "${pkg}" >/dev/null 2>&1
 }
 
@@ -303,11 +299,51 @@ check_and_install_packages() {
     if [[ "${IS_TERMUX}" == true ]]; then
         pkg update -y
         pkg install -y "${missing[@]}"
+
+        # tur-repo provides prebuilt python-pandas (not in main Termux repo).
+        # Without it, pip tries to compile pandas from source → fails on Android.
+        if ! package_installed "tur-repo"; then
+            log_info "Installing tur-repo (provides prebuilt python-pandas)..."
+            pkg install -y tur-repo || log_warn "tur-repo install failed — pandas may not be available as prebuilt"
+        fi
+
+        # Prebuilt numpy/pandas from pkg — pip skips compiling from source.
+        local prebuilt_pkgs=()
+        package_installed "python-numpy"  || prebuilt_pkgs+=(python-numpy)
+        package_installed "python-pandas" || prebuilt_pkgs+=(python-pandas)
+        if [[ ${#prebuilt_pkgs[@]} -gt 0 ]]; then
+            log_info "Installing prebuilt ${prebuilt_pkgs[*]} (no source compile)..."
+            pkg install -y "${prebuilt_pkgs[@]}" || log_warn "Prebuilt package install failed"
+        fi
     else
         ${SUDO} apt-get update -y
         ${SUDO} apt-get install -y "${missing[@]}"
     fi
     log_success "Missing packages installed successfully."
+}
+
+# ----------------------------------------------------------------------------
+# Python version check
+# ----------------------------------------------------------------------------
+
+check_python_version() {
+    local py=""
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then py="$c"; break; fi
+    done
+    [[ -n "$py" ]] || die "Python not found — install python (Termux: pkg install python)"
+
+    local ver=""
+    ver="$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "0.0")"
+    if [[ "$ver" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        local major="${BASH_REMATCH[1]}"
+        local minor="${BASH_REMATCH[2]}"
+        if (( 10#$major > 3 )) || (( 10#$major == 3 && 10#$minor >= 10 )); then
+            log_success "Python ${ver} found (${py})"
+            return 0
+        fi
+    fi
+    die "Python >= 3.10 is required (found ${ver:-unknown}). Install a newer Python and re-run."
 }
 
 # ----------------------------------------------------------------------------
@@ -367,9 +403,6 @@ setup_virtualenv() {
     else
         log_info "Creating virtual environment..."
         if [[ "${IS_TERMUX}" == true ]]; then
-            # Reuse Termux's prebuilt numpy/pandas (installed via pkg) instead
-            # of letting pip compile them from source, which is slow and
-            # frequently fails on Android/Termux.
             python3 -m venv --system-site-packages .venv
         else
             python3 -m venv .venv
@@ -384,12 +417,47 @@ setup_virtualenv() {
     pip install --upgrade pip --quiet
 
     if [[ -f "requirements.txt" ]]; then
-        log_info "Installing dependencies from requirements.txt..."
-        pip install -r requirements.txt --quiet
+        local req_file="requirements.txt"
+        local tmp_req=""
+
+        # On Termux, pandas/numpy are prebuilt via pkg (--system-site-packages).
+        # pip still tries to install them from requirements.txt but there are
+        # no aarch64 wheels on PyPI → "failed wheel build". Filter them out.
+        if [[ "${IS_TERMUX}" == true ]]; then
+            tmp_req="$(mktemp)"
+            grep -viE '^(pandas|numpy)$' "requirements.txt" > "$tmp_req"
+            req_file="$tmp_req"
+            log_info "Termux detected — skipping pip install of pandas/numpy (using pkg prebuilts)"
+        fi
+
+        log_info "Installing dependencies from ${req_file}..."
+        pip install -r "${req_file}" --quiet
+        rm -f "$tmp_req"
         log_success "Dependencies installed."
     else
         log_warn "No requirements.txt found. Skipping dependency installation."
     fi
+
+    # Optional: on-chain / Web3 deps (solders requires Rust toolchain;
+    # fails on Termux — safe to skip for CEX-only trading).
+    if [[ -f "requirements-onchain.txt" ]]; then
+        log_info "Installing on-chain dependencies (optional)..."
+        if pip install -r requirements-onchain.txt --quiet 2>/dev/null; then
+            log_success "On-chain dependencies installed."
+        else
+            log_warn "On-chain deps (solders/web3) skipped — Rust toolchain missing. CEX trading unaffected."
+        fi
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Data folders
+# ----------------------------------------------------------------------------
+
+setup_folders() {
+    cd "${INSTALL_DIR}"
+    mkdir -p data logs backups
+    log_success "Runtime folders ready: data/ logs/ backups/"
 }
 
 # ----------------------------------------------------------------------------
@@ -406,13 +474,125 @@ setup_env_file() {
         return 0
     fi
 
-    if [[ -f ".env.example" ]]; then
-        cp ".env.example" ".env"
-        log_success "Created .env from .env.example."
-        log_warn "Remember to edit .env with your configuration before running ZetBot AI."
-    else
+    if [[ ! -f ".env.example" ]]; then
         log_warn "No .env.example found. Skipping .env creation."
+        return 0
     fi
+
+    cp ".env.example" ".env"
+    chmod 600 ".env" 2>/dev/null || true
+    log_success "Created .env from .env.example."
+
+    # Interactive exchange selection (only for fresh .env, non-interactive mode skips)
+    if [[ "${NONINTERACTIVE}" == true ]] || [[ ! -t 0 && ! -e /dev/tty ]]; then
+        log_info "Non-interactive mode — configure .env manually with: nano .env"
+        return 0
+    fi
+
+    echo ""
+    printf '%b%s%b\n' "${C_CYAN}${C_BOLD}" "  Pilih exchange untuk PAPER TRADING (uang simulasi — aman):" "${C_RESET}"
+    printf '  %b1)%b Indodax  — pasangan Rupiah (IDR)\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %b2)%b Binance  — pasangan USDT\n' "${C_BOLD}" "${C_RESET}"
+
+    local choice=""
+    printf '  Pilihan [1]: '
+    read -r choice < /dev/tty || true
+    choice="${choice:-1}"
+    if [[ "$choice" != "1" && "$choice" != "2" ]]; then
+        log_warn "Pilihan '$choice' tidak valid — memakai bawaan (1) Indodax"
+        choice="1"
+    fi
+
+    local exchange="" quote="" balance=""
+    case "$choice" in
+        1) exchange="indodax"; quote="IDR"; balance="1000000" ;;
+        2) exchange="binance"; quote="USDT"; balance="10000" ;;
+    esac
+
+    sed -E -i.bak \
+        -e "s/^[[:space:]]*EXCHANGE=.*/EXCHANGE=$exchange/" \
+        -e "s/^[[:space:]]*QUOTE_CURRENCY=.*/QUOTE_CURRENCY=$quote/" \
+        -e "s/^[[:space:]]*ACCOUNT_BALANCE=.*/ACCOUNT_BALANCE=$balance/" \
+        -e "s/^[[:space:]]*PAPER_MODE=.*/PAPER_MODE=true/" \
+        .env
+    rm -f .env.bak
+
+    log_success "Konfigurasi: EXCHANGE=$exchange · QUOTE_CURRENCY=$quote · ACCOUNT_BALANCE=$balance"
+    log_success "PAPER_MODE=true — semua transaksi SIMULASI, tidak ada uang asli"
+}
+
+# ----------------------------------------------------------------------------
+# Termux:Widget shortcut (one-tap start from home screen)
+# ----------------------------------------------------------------------------
+
+setup_widget() {
+    if [[ "${IS_TERMUX}" != true ]]; then
+        return 0
+    fi
+    if [[ "${INSTALL_DIR}" != "$HOME/zetbot-ai" ]]; then
+        return 0
+    fi
+
+    local short_dir="$HOME/.shortcuts"
+    local short_file="$short_dir/zetbot-start.sh"
+
+    if [[ -f "$short_file" ]]; then
+        log_success "Termux:Widget shortcut already present."
+        return 0
+    fi
+
+    mkdir -p "$short_dir"
+    printf '#!/usr/bin/env bash\ncd ~/zetbot-ai && bash run.sh\n' > "$short_file"
+    chmod 700 "$short_file"
+    log_success "Termux:Widget shortcut created (~/.shortcuts/zetbot-start.sh)"
+    log_info "Install Termux:Widget app, add a widget, tap to start the bot."
+}
+
+# ----------------------------------------------------------------------------
+# Self-check
+# ----------------------------------------------------------------------------
+
+self_check() {
+    log_step "Running self-check"
+
+    cd "${INSTALL_DIR}"
+    # shellcheck disable=SC1091
+    source .venv/bin/activate 2>/dev/null || true
+
+    local failures=0
+
+    # Core imports
+    if python3 -c "import sys; import ccxt, requests, dotenv, colorama" 2>/dev/null; then
+        log_success "Core dependencies importable (ccxt, requests, dotenv, colorama)"
+    else
+        log_error "Core dependencies cannot be imported — re-run: bash install.sh"
+        ((failures++))
+    fi
+
+    # .env
+    if [[ -f ".env" ]]; then
+        log_success ".env present"
+    else
+        log_error ".env missing"
+        ((failures++))
+    fi
+
+    # Folders
+    if [[ -d "data" ]] && [[ -d "logs" ]]; then
+        log_success "Runtime folders present"
+    else
+        log_error "Runtime folders missing"
+        ((failures++))
+    fi
+
+    # Pandas/numpy (critical for the bot)
+    if python3 -c "import pandas; import numpy" 2>/dev/null; then
+        log_success "pandas + numpy importable"
+    else
+        log_warn "pandas/numpy not importable — bot may fail. Re-run: bash install.sh"
+    fi
+
+    return "$failures"
 }
 
 # ----------------------------------------------------------------------------
@@ -425,12 +605,17 @@ print_summary() {
     printf '  %bLocation:%b %s\n' "${C_BOLD}" "${C_RESET}" "${INSTALL_DIR}"
     printf '  %bBranch:%b   %s\n' "${C_BOLD}" "${C_RESET}" "${BRANCH}"
     printf '\n'
-    log_info "The installer does not run setup.sh or start ZetBot AI automatically."
-    log_info "Review your configuration in ${INSTALL_DIR}/.env, then continue with:"
+
+    log_info "Next steps:"
     printf '\n'
     printf '    cd %s\n' "${INSTALL_DIR}"
-    printf '    bash setup.sh   %b# if provided by the project%b\n' "${C_CYAN}" "${C_RESET}"
+    printf '    nano .env       %b# edit credentials (API keys, Telegram, etc.)%b\n' "${C_CYAN}" "${C_RESET}"
+    printf '    bash run.sh     %b# start the bot (paper mode by default)%b\n' "${C_CYAN}" "${C_RESET}"
     printf '\n'
+    printf '  %bUseful commands:%b\n' "${C_BOLD}" "${C_RESET}"
+    printf '    bash update.sh    → update the bot'
+    printf '    bash uninstall.sh → remove (config/data preserved)'
+    printf '\n\n'
 }
 
 # ----------------------------------------------------------------------------
@@ -445,10 +630,14 @@ main() {
     detect_environment
     check_internet
     check_and_install_packages
+    check_python_version
     choose_install_dir
     clone_or_update_repo
     setup_virtualenv
+    setup_folders
     setup_env_file
+    setup_widget
+    self_check || true
     print_summary
 }
 
